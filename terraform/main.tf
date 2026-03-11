@@ -18,14 +18,101 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_caller_identity" "current" {}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = "${path.module}/../lambda_function/app.py"
   output_path = "${path.module}/lambda_function_payload.zip"
 }
 
+resource "aws_kms_key" "security" {
+  description             = "KMS key for Lambda Security Event Analyzer resources"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EnableRootPermissions"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_kms_alias" "security" {
+  name          = "alias/lambda-security-event-analyzer"
+  target_key_id = aws_kms_key.security.key_id
+}
+
+resource "aws_vpc" "lambda_vpc" {
+  cidr_block           = "10.50.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name    = "${var.project_name}-vpc"
+    Project = var.project_name
+  }
+}
+
+resource "aws_subnet" "private_a" {
+  vpc_id                  = aws_vpc.lambda_vpc.id
+  cidr_block              = "10.50.1.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name    = "${var.project_name}-private-a"
+    Project = var.project_name
+  }
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id                  = aws_vpc.lambda_vpc.id
+  cidr_block              = "10.50.2.0/24"
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name    = "${var.project_name}-private-b"
+    Project = var.project_name
+  }
+}
+
+resource "aws_security_group" "lambda_sg" {
+  name        = "${var.project_name}-lambda-sg"
+  description = "Security group for Lambda function"
+  vpc_id      = aws_vpc.lambda_vpc.id
+
+  egress {
+    description = "HTTPS outbound"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name    = "${var.project_name}-lambda-sg"
+    Project = var.project_name
+  }
+}
+
 resource "aws_sns_topic" "security_alerts" {
-  name = "${var.project_name}-alerts"
+  name              = "${var.project_name}-alerts"
+  kms_master_key_id = aws_kms_key.security.arn
 }
 
 resource "aws_sns_topic_subscription" "email_alerts" {
@@ -42,6 +129,15 @@ resource "aws_dynamodb_table" "security_findings" {
   attribute {
     name = "finding_id"
     type = "S"
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.security.arn
+  }
+
+  point_in_time_recovery {
+    enabled = true
   }
 
   tags = {
@@ -82,7 +178,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "source_bucket" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      kms_master_key_id = aws_kms_key.security.arn
+      sse_algorithm     = "aws:kms"
     }
   }
 }
@@ -118,7 +215,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "quarantine_bucket
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      kms_master_key_id = aws_kms_key.security.arn
+      sse_algorithm     = "aws:kms"
     }
   }
 }
@@ -147,17 +245,16 @@ resource "aws_iam_policy" "lambda_custom_policy" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "AllowCloudWatchLogs"
+        Sid    = "AllowSpecificLogWrites"
         Effect = "Allow"
         Action = [
           "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:CreateLogGroup"
+          "logs:PutLogEvents"
         ]
-        Resource = "*"
+        Resource = "${aws_cloudwatch_log_group.lambda_logs.arn}:*"
       },
       {
-        Sid    = "AllowSNSPublish"
+        Sid    = "AllowPublishAlerts"
         Effect = "Allow"
         Action = [
           "sns:Publish"
@@ -165,7 +262,7 @@ resource "aws_iam_policy" "lambda_custom_policy" {
         Resource = aws_sns_topic.security_alerts.arn
       },
       {
-        Sid    = "AllowDynamoDBWrite"
+        Sid    = "AllowWriteFindings"
         Effect = "Allow"
         Action = [
           "dynamodb:PutItem"
@@ -173,17 +270,33 @@ resource "aws_iam_policy" "lambda_custom_policy" {
         Resource = aws_dynamodb_table.security_findings.arn
       },
       {
-        Sid    = "AllowS3ReadWriteForRemediation"
+        Sid    = "AllowReadFromSourceBucket"
         Effect = "Allow"
         Action = [
-          "s3:GetObject",
-          "s3:DeleteObject",
+          "s3:GetObject"
+        ]
+        Resource = "${aws_s3_bucket.source_bucket.arn}/*"
+      },
+      {
+        Sid    = "AllowDeleteFromSourceBucket"
+        Effect = "Allow"
+        Action = [
+          "s3:DeleteObject"
+        ]
+        Resource = "${aws_s3_bucket.source_bucket.arn}/*"
+      },
+      {
+        Sid    = "AllowWriteToQuarantineBucket"
+        Effect = "Allow"
+        Action = [
           "s3:PutObject"
         ]
-        Resource = [
-          "${aws_s3_bucket.source_bucket.arn}/*",
-          "${aws_s3_bucket.quarantine_bucket.arn}/*"
-        ]
+        Resource = "${aws_s3_bucket.quarantine_bucket.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-server-side-encryption" = "aws:kms"
+          }
+        }
       }
     ]
   })
@@ -196,7 +309,27 @@ resource "aws_iam_role_policy_attachment" "lambda_custom_policy_attach" {
 
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/${var.project_name}"
-  retention_in_days = 14
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.security.arn
+}
+
+resource "aws_signer_signing_profile" "lambda_signing_profile" {
+  name_prefix = "${var.project_name}-signer-"
+  platform_id = "AWSLambda-SHA384-ECDSA"
+}
+
+resource "aws_lambda_code_signing_config" "lambda_csc" {
+  description = "Code signing config for Lambda Security Event Analyzer"
+
+  allowed_publishers {
+    signing_profile_version_arns = [
+      aws_signer_signing_profile.lambda_signing_profile.version_arn
+    ]
+  }
+
+  policies {
+    untrusted_artifact_on_deployment = "Warn"
+  }
 }
 
 resource "aws_lambda_function" "security_analyzer" {
@@ -210,13 +343,25 @@ resource "aws_lambda_function" "security_analyzer" {
 
   timeout     = 15
   memory_size = 256
+  kms_key_arn = aws_kms_key.security.arn
+
+  tracing_config {
+    mode = "Active"
+  }
+
+  vpc_config {
+    subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+
+  code_signing_config_arn = aws_lambda_code_signing_config.lambda_csc.arn
 
   environment {
     variables = {
-      FUNCTION_NAME     = var.project_name
-      SNS_TOPIC_ARN     = aws_sns_topic.security_alerts.arn
-      FINDINGS_TABLE    = aws_dynamodb_table.security_findings.name
-      QUARANTINE_BUCKET = aws_s3_bucket.quarantine_bucket.bucket
+      FUNCTION_NAME      = var.project_name
+      SNS_TOPIC_ARN      = aws_sns_topic.security_alerts.arn
+      FINDINGS_TABLE     = aws_dynamodb_table.security_findings.name
+      QUARANTINE_BUCKET  = aws_s3_bucket.quarantine_bucket.bucket
       ENABLE_REMEDIATION = "true"
     }
   }
@@ -248,10 +393,10 @@ resource "aws_s3_bucket_notification" "bucket_notification" {
 
 resource "aws_cloudwatch_event_rule" "iam_activity_rule" {
   name        = "${var.project_name}-iam-events"
-  description = "Captures sensitive IAM API activity from CloudTrail via EventBridge"
+  description = "Captures IAM API activity via EventBridge"
 
   event_pattern = jsonencode({
-    source = ["aws.iam"]
+    source      = ["aws.iam"]
     detail-type = ["AWS API Call via CloudTrail"]
   })
 }

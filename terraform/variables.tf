@@ -25,5 +25,5 @@ variable "quarantine_bucket_name" {
 variable "alert_email" {
   description = "Email address for SNS security alerts"
   type        = string
-  default     = "oluwafemiokunlola308@gmail.com"
+  default     = "you@example.com"
 }
